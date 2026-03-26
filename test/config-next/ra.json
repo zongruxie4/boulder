@@ -163,8 +163,7 @@
 			"CAARechecksFailOrder": true,
 			"AutomaticallyPauseZombieClients": true,
 			"DNSAccount01Enabled": true,
-			"DNSPersist01Enabled": true,
-			"NoPendingAuthzReuse": true
+			"DNSPersist01Enabled": true
 		}
 	},
 	"pa": {
