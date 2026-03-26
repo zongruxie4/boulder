@@ -113,6 +113,11 @@ type vaMetrics struct {
 	http01Redirects                   prometheus.Counter
 	caaCounter                        *prometheus.CounterVec
 	ipv4FallbackCounter               prometheus.Counter
+	// experimentConcurrence tracks whether the primary and experimental VAs
+	// reached the same outcome. It's labelled by:
+	//   - operation: [dcv|caa]
+	//   - concurrence: [true|false]
+	experimentConcurrence *prometheus.CounterVec
 }
 
 func initMetrics(stats prometheus.Registerer) *vaMetrics {
@@ -145,6 +150,10 @@ func initMetrics(stats prometheus.Registerer) *vaMetrics {
 		Name: "tls_alpn_ipv4_fallback",
 		Help: "A counter of IPv4 fallbacks during TLS ALPN validation",
 	})
+	experimentConcurrence := promauto.With(stats).NewCounterVec(prometheus.CounterOpts{
+		Name: "experiment_concurrence",
+		Help: "Count of validations where the experimental VA did or did not concur with the primary VA",
+	}, []string{"operation", "concurrence"})
 
 	return &vaMetrics{
 		validationLatency:                 validationLatency,
@@ -154,6 +163,7 @@ func initMetrics(stats prometheus.Registerer) *vaMetrics {
 		http01Redirects:                   http01Redirects,
 		caaCounter:                        caaCounter,
 		ipv4FallbackCounter:               ipv4FallbackCounter,
+		experimentConcurrence:             experimentConcurrence,
 	}
 }
 
@@ -188,23 +198,26 @@ func newDefaultPortConfig() *portConfig {
 type ValidationAuthorityImpl struct {
 	vapb.UnsafeVAServer
 	vapb.UnsafeCAAServer
-	log                  blog.Logger
-	dnsClient            bdns.Client
-	issuerDomain         string
-	httpPort             int
-	httpsPort            int
-	tlsPort              int
-	userAgent            string
-	clk                  clock.Clock
-	remoteVAs            []RemoteVA
-	maxRemoteFailures    int
-	accountURIPrefixes   []string
-	singleDialTimeout    time.Duration
-	slowRemoteTimeout    time.Duration
-	perspective          string
-	rir                  string
-	isReservedIPFunc     func(netip.Addr) error
-	allowRestrictedAddrs bool
+	log                      blog.Logger
+	dnsClient                bdns.Client
+	issuerDomain             string
+	httpPort                 int
+	httpsPort                int
+	tlsPort                  int
+	userAgent                string
+	clk                      clock.Clock
+	remoteVAs                []RemoteVA
+	maxRemoteFailures        int
+	accountURIPrefixes       []string
+	singleDialTimeout        time.Duration
+	slowRemoteTimeout        time.Duration
+	perspective              string
+	rir                      string
+	isReservedIPFunc         func(netip.Addr) error
+	allowRestrictedAddrs     bool
+	experimentalVA           *ValidationAuthorityImpl
+	experimentalVASampleRate float64
+	experimentalVATimeout    time.Duration
 
 	metrics *vaMetrics
 }
@@ -227,6 +240,9 @@ func NewValidationAuthorityImpl(
 	reservedIPChecker func(netip.Addr) error,
 	slowRemoteTimeout time.Duration,
 	allowRestrictedAddrs bool,
+	experimentalVA *ValidationAuthorityImpl,
+	experimentalVASampleRate float64,
+	experimentalVATimeout time.Duration,
 ) (*ValidationAuthorityImpl, error) {
 
 	if len(accountURIPrefixes) == 0 {
@@ -268,15 +284,54 @@ func NewValidationAuthorityImpl(
 		// before timing out. This timeout ignores the base RPC timeout and is strictly
 		// used for the DialContext operations that take place during an
 		// HTTP-01 challenge validation.
-		singleDialTimeout:    10 * time.Second,
-		slowRemoteTimeout:    slowRemoteTimeout,
-		perspective:          perspective,
-		rir:                  rir,
-		isReservedIPFunc:     reservedIPChecker,
-		allowRestrictedAddrs: allowRestrictedAddrs,
+		singleDialTimeout:        10 * time.Second,
+		slowRemoteTimeout:        slowRemoteTimeout,
+		perspective:              perspective,
+		rir:                      rir,
+		isReservedIPFunc:         reservedIPChecker,
+		allowRestrictedAddrs:     allowRestrictedAddrs,
+		experimentalVA:           experimentalVA,
+		experimentalVASampleRate: experimentalVASampleRate,
+		experimentalVATimeout:    experimentalVATimeout,
 	}
 
 	return va, nil
+}
+
+func (va *ValidationAuthorityImpl) shouldRunExperiment() bool {
+	return va.experimentalVA != nil && rand.Float64() < va.experimentalVASampleRate
+}
+
+// runExperiment compares the primary VA's local result against the experimental
+// VA's result and records a concurrence metric. On disagreement, it logs a
+// structured event with both results. The primary argument must be non-nil.
+// Callers should invoke this in a goroutine.
+func (va *ValidationAuthorityImpl) runExperiment(ctx context.Context, operation string, primary remoteResult, experimentFunc func(context.Context) (remoteResult, error)) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), va.experimentalVATimeout)
+	defer cancel()
+
+	experimentResult, err := experimentFunc(ctx)
+
+	primaryPassed := primary.GetProblem() == nil
+	experimentPassed := (err == nil) && (experimentResult.GetProblem() == nil)
+
+	if primaryPassed == experimentPassed {
+		va.metrics.experimentConcurrence.WithLabelValues(operation, "true").Inc()
+		return
+	}
+	va.metrics.experimentConcurrence.WithLabelValues(operation, "false").Inc()
+
+	logArgs := map[string]any{
+		"operation":        operation,
+		"primaryPassed":    primaryPassed,
+		"primaryResult":    primary,
+		"experimentPassed": experimentPassed,
+		"experimentResult": experimentResult,
+	}
+	if err != nil {
+		logArgs["experimentErr"] = err.Error()
+	}
+	va.log.AuditInfo("Primary VA disagreed with experimental VA", logArgs)
 }
 
 // maxAllowedFailures returns the maximum number of allowed failures
@@ -767,7 +822,27 @@ func (va *ValidationAuthorityImpl) DoDCV(ctx context.Context, req *vapb.PerformV
 	if err != nil {
 		logEvent.InternalError = err.Error()
 		prob = detailedError(err)
-		return bgrpc.ValidationResultToPB(records, filterProblemDetails(prob), va.perspective, va.rir)
+	}
+
+	// Capture the local validation result for experimental resolver comparison
+	// before MPIC can influence the outcome.
+	localResult, err := bgrpc.ValidationResultToPB(records, filterProblemDetails(prob), va.perspective, va.rir)
+	if err != nil {
+		return nil, err
+	}
+
+	if va.shouldRunExperiment() {
+		go va.runExperiment(
+			ctx,
+			opDCV,
+			proto.Clone(localResult).(*vapb.ValidationResult),
+			func(ctx context.Context) (remoteResult, error) {
+				return va.experimentalVA.DoDCV(ctx, req)
+			})
+	}
+
+	if prob != nil {
+		return localResult, nil
 	}
 
 	if va.isPrimaryVA() {
