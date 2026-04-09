@@ -30,6 +30,9 @@ import (
 )
 
 type ipFakeDNS struct {
+	// If non-nil, this IP address will be returned by the appropriate method (LookupA / LookupAAAA) depending on
+	// whether it is IPv4 or IPv6. Otherwise those methods return 127.0.0.1 / ::1.
+	ip net.IP
 	bdns.Client
 }
 
@@ -46,14 +49,19 @@ func (c *ipFakeDNS) LookupA(_ context.Context, hostname string) (*bdns.Result[*d
 	if strings.HasSuffix(hostname, ".invalid") {
 		return wrapA()
 	}
+
+	ip := net.IPv4(127, 0, 0, 1)
+	if c.ip != nil && c.ip.To4() != nil {
+		ip = c.ip
+	}
 	// dual-homed host with an IPv6 and an IPv4 address
 	if hostname == "ipv4.and.ipv6.localhost" {
-		return wrapA(net.IPv4(127, 0, 0, 1))
+		return wrapA(ip)
 	}
 	if hostname == "ipv6.localhost" {
 		return wrapA()
 	}
-	return wrapA(net.IPv4(127, 0, 0, 1))
+	return wrapA(ip)
 }
 
 func (c *ipFakeDNS) LookupAAAA(_ context.Context, hostname string) (*bdns.Result[*dns.AAAA], string, error) {
@@ -65,12 +73,17 @@ func (c *ipFakeDNS) LookupAAAA(_ context.Context, hostname string) (*bdns.Result
 		return &bdns.Result[*dns.AAAA]{Final: rrs}, "ipFakeDNS", nil
 	}
 
+	ip := net.IPv6loopback
+	if c.ip != nil && c.ip.To4() == nil {
+		ip = c.ip
+	}
+
 	// dual-homed host with an IPv6 and an IPv4 address
 	if hostname == "ipv4.and.ipv6.localhost" {
-		return wrapAAAA(net.IPv6loopback)
+		return wrapAAAA(ip)
 	}
 	if hostname == "ipv6.localhost" {
-		return wrapAAAA(net.IPv6loopback)
+		return wrapAAAA(ip)
 	}
 	return wrapAAAA()
 }
