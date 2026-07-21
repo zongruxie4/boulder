@@ -4362,6 +4362,7 @@ func newAcctKey(t *testing.T) []byte {
 }
 
 func TestUpdateRegistrationKey(t *testing.T) {
+	t.Parallel()
 	sa, _ := initSA(t)
 
 	_, err := sa.UpdateRegistrationKey(ctx, &sapb.UpdateRegistrationKeyRequest{})
@@ -4395,6 +4396,8 @@ func TestUpdateRegistrationKey(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			reg, err := sa.NewRegistration(ctx, &corepb.Registration{
 				Key: newAcctKey(t),
 			})
