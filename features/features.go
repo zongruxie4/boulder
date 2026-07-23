@@ -73,6 +73,12 @@ type Config struct {
 	// to find and revoke accounts using keys which have been added to the
 	// blockedKeys table.
 	RevokeBadKeyAccounts bool
+
+	// SetAuthzProcessing controls whether the RA attempts to mark authorizations
+	// as "processing" before dispatching validation to the VA. This reduces
+	// unnecessary work due to parallel validations, but requires a database
+	// change to work.
+	SetAuthzProcessing bool
 }
 
 var fMu = new(sync.RWMutex)
